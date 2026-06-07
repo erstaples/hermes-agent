@@ -9129,6 +9129,8 @@ class HermesCLI:
             self._handle_agents_command()
         elif canonical == "background":
             self._handle_background_command(cmd_original)
+        elif canonical == "claude":
+            self._handle_claude_command(cmd_original)
         elif canonical == "queue":
             # Extract prompt after "/queue " or "/q "
             parts = cmd_original.split(None, 1)
@@ -9466,6 +9468,97 @@ class HermesCLI:
         thread = threading.Thread(target=run_background, daemon=True, name=f"bg-task-{task_id}")
         self._background_tasks[task_id] = thread
         thread.start()
+
+    def _handle_claude_command(self, cmd: str):
+        """Handle /claude <session-name> — spawn Claude Code in a project.
+
+        Auto-discovers git repos under ~/code/git.home/ and prompts the user
+        to pick one. Then spawns:
+
+            cd <project> && claude --remote-control <name> \\
+                --worktree <name> --permission-mode bypassPermissions
+        """
+        import shlex
+        import subprocess
+        from pathlib import Path as _Path
+
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /claude <session-name>")
+            _cprint("  Example: /claude docs-consolidation")
+            _cprint("  You'll be prompted to pick a project (auto-discovered)")
+            _cprint("  from ~/code/git.home/.")
+            return
+
+        session_name = parts[1].strip().split()[0]
+
+        # Discover git repos under ~/code/git.home/
+        projects_root = _Path.home() / "code" / "git.home"
+        try:
+            candidates = sorted(
+                p for p in projects_root.iterdir()
+                if p.is_dir() and (p / ".git").exists()
+            )
+        except FileNotFoundError:
+            _cprint(f"  ❌ Projects directory not found: {projects_root}")
+            return
+        except Exception as exc:
+            _cprint(f"  ❌ Failed to scan {projects_root}: {exc}")
+            return
+
+        if not candidates:
+            _cprint(f"  ❌ No git repos found under {projects_root}")
+            return
+
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            _cprint(f"\n  Pick a project for /claude {session_name}:")
+            for i, p in enumerate(candidates, 1):
+                _cprint(f"    {i}. {p.name}")
+            try:
+                raw = input("  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                _cprint("  Cancelled.")
+                return
+            chosen = None
+            if raw.isdigit():
+                idx = int(raw) - 1
+                if 0 <= idx < len(candidates):
+                    chosen = candidates[idx]
+            if chosen is None:
+                lc = raw.lower()
+                for p in candidates:
+                    if p.name.lower() == lc:
+                        chosen = p
+                        break
+            if chosen is None:
+                _cprint(f"  ❌ Couldn't match '{raw}' to a project.")
+                return
+
+        command = (
+            f"cd {shlex.quote(str(chosen))} && "
+            f"claude --remote-control {shlex.quote(session_name)} "
+            f"--worktree {shlex.quote(session_name)} "
+            f"--permission-mode bypassPermissions"
+        )
+
+        _cprint(f"  🚀 Spawning Claude Code in {chosen.name}...")
+        _cprint(f"  Session/worktree: {session_name}")
+        _cprint(f"  Command: {command}\n")
+
+        try:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _cprint(f"  ✅ Claude Code started (PID: {proc.pid})")
+            _cprint("  Process runs independently — check with `jobs` or `ps`.\n")
+        except Exception as e:
+            _cprint(f"  ❌ Failed to start Claude Code: {e}")
 
     @staticmethod
     def _try_launch_chrome_debug(port: int, system: str) -> bool:

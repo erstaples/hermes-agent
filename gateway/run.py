@@ -7929,6 +7929,9 @@ class GatewayRunner:
             # name, so this branch handles both commands.
             if _cmd_def_inner and _cmd_def_inner.name == "background":
                 return await self._handle_background_command(event)
+            # /claude spawns a Claude Code process — must bypass the guard.
+            if _cmd_def_inner and _cmd_def_inner.name == "claude":
+                return await self._handle_claude_command(event)
 
             # /kanban must bypass the guard. It writes to a profile-agnostic
             # DB (kanban.db), not to the running agent's state. In fact
@@ -12701,6 +12704,195 @@ class GatewayRunner:
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
+
+    async def _handle_claude_command(self, event: MessageEvent) -> str:
+        """Handle ``/claude <session-name>`` — spawn Claude Code in a project.
+
+        Always shows a project picker (auto-discovered git repos under
+        ``~/code/git.home/``). On Telegram/Discord renders inline buttons via
+        the existing clarify primitive; on platforms without rich UI it falls
+        back to a numbered text prompt resolved by the gateway's text-intercept.
+
+        On project selection, spawns:
+            cd <project> && claude --remote-control <name> \\
+                --worktree <name> --permission-mode bypassPermissions
+
+        as a detached background process and posts the result back to the chat.
+        """
+        import asyncio as _asyncio
+        import shlex
+        import subprocess
+        import uuid as _uuid
+        from pathlib import Path as _Path
+
+        from tools import clarify_gateway as _clarify_mod
+
+        session_name = event.get_command_args().strip().split()[0] if event.get_command_args().strip() else ""
+        if not session_name:
+            return (
+                "Usage: /claude <session-name>\n"
+                "Example: /claude docs-consolidation\n"
+                "Spawns Claude Code with --remote-control, --worktree set to <session-name>, "
+                "and --permission-mode bypassPermissions. You'll be prompted to pick the project."
+            )
+
+        # Discover candidate projects: any subdirectory of ~/code/git.home/
+        # that is a git repo (has a .git/ directory or file). Sorted alphabetically.
+        projects_root = _Path.home() / "code" / "git.home"
+        try:
+            candidates = sorted(
+                p for p in projects_root.iterdir()
+                if p.is_dir() and (p / ".git").exists()
+            )
+        except FileNotFoundError:
+            return f"❌ Projects directory not found: {projects_root}"
+        except Exception as exc:
+            return f"❌ Failed to scan {projects_root}: {exc}"
+
+        if not candidates:
+            return f"❌ No git repos found under {projects_root}"
+
+        # Resolve session_key + adapter + chat_id for the picker + follow-up reply.
+        source = event.source
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            return f"❌ No adapter registered for platform: {source.platform}"
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = f"{source.platform}:{source.chat_id}"
+
+        thread_metadata = self._thread_metadata_for_source(source, event.message_id)
+
+        def _spawn(project_path: _Path) -> str:
+            """Spawn Claude Code in ``project_path`` and return a status string."""
+            command = (
+                f"cd {shlex.quote(str(project_path))} && "
+                f"claude --remote-control {shlex.quote(session_name)} "
+                f"--worktree {shlex.quote(session_name)} "
+                f"--permission-mode bypassPermissions"
+            )
+            try:
+                proc = subprocess.Popen(
+                    command,
+                    shell=True,
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return (
+                    f"🚀 Claude Code started (PID: {proc.pid})\n"
+                    f"  Project: {project_path.name}\n"
+                    f"  Session/worktree: {session_name}\n"
+                    f"  Runs detached; check `jobs` / `ps`."
+                )
+            except Exception as exc:
+                return f"❌ Failed to start Claude Code: {exc}"
+
+        # Short-circuit: only one candidate → no need to prompt.
+        if len(candidates) == 1:
+            return _spawn(candidates[0])
+
+        # Build choice labels (project name) and a parallel lookup → Path.
+        choice_labels = [p.name for p in candidates]
+        label_to_path = {p.name: p for p in candidates}
+
+        # Register a clarify entry — buttons (Telegram/Discord) or text-fallback.
+        clarify_id = _uuid.uuid4().hex[:10]
+        _clarify_mod.register(
+            clarify_id=clarify_id,
+            session_key=session_key,
+            question=f"Pick a project for `/claude {session_name}`:",
+            choices=list(choice_labels),
+        )
+
+        # Send the picker. Some adapters expose send_clarify, others don't —
+        # if not, render a numbered list as a regular message and rely on
+        # text-intercept to resolve the response.
+        send_clarify_fn = getattr(adapter, "send_clarify", None)
+        sent_ok = False
+        if send_clarify_fn is not None:
+            try:
+                result = await send_clarify_fn(
+                    chat_id=source.chat_id,
+                    question=f"Pick a project for `/claude {session_name}`:",
+                    choices=list(choice_labels),
+                    clarify_id=clarify_id,
+                    session_key=session_key,
+                    metadata=thread_metadata,
+                )
+                sent_ok = bool(getattr(result, "success", False))
+            except Exception as exc:
+                logger.warning("send_clarify failed for /claude picker: %s", exc)
+                sent_ok = False
+
+        if not sent_ok:
+            # Fallback: numbered list as plain text; flip the entry into
+            # text-capture mode so the next user reply resolves it.
+            _clarify_mod.mark_awaiting_text(clarify_id)
+            menu = "\n".join(f"  {i + 1}. {name}" for i, name in enumerate(choice_labels))
+            try:
+                await adapter.send(
+                    source.chat_id,
+                    (
+                        f"Pick a project for `/claude {session_name}` — "
+                        f"reply with the number or name:\n{menu}"
+                    ),
+                    metadata=thread_metadata,
+                )
+            except Exception as exc:
+                _clarify_mod.clear_session(session_key)
+                return f"❌ Failed to send picker: {exc}"
+
+        # Wait for the user's response on a worker thread so we don't block
+        # the gateway event loop. When it resolves, spawn Claude and post
+        # the result back to the chat as a follow-up message.
+        timeout = _clarify_mod.get_clarify_timeout()
+
+        async def _await_and_spawn() -> None:
+            response = await _asyncio.to_thread(
+                _clarify_mod.wait_for_response, clarify_id, float(timeout),
+            )
+            if not response:
+                follow_up = (
+                    f"⌛ /claude picker timed out after {int(timeout / 60)}m — "
+                    f"no project selected. Re-run `/claude {session_name}` to retry."
+                )
+            else:
+                resp = response.strip()
+                chosen: _Path | None = None
+                # Match: exact label, numeric index, case-insensitive label.
+                if resp in label_to_path:
+                    chosen = label_to_path[resp]
+                elif resp.isdigit():
+                    idx = int(resp) - 1
+                    if 0 <= idx < len(candidates):
+                        chosen = candidates[idx]
+                else:
+                    lc = resp.lower()
+                    for name, path in label_to_path.items():
+                        if name.lower() == lc:
+                            chosen = path
+                            break
+                if chosen is None:
+                    follow_up = (
+                        f"❌ Couldn't match `{response}` to a project. "
+                        f"Re-run `/claude {session_name}` and pick from the list."
+                    )
+                else:
+                    follow_up = _spawn(chosen)
+            try:
+                await adapter.send(source.chat_id, follow_up, metadata=thread_metadata)
+            except Exception as exc:
+                logger.warning("Failed to post /claude follow-up: %s", exc)
+
+        _task = _asyncio.create_task(_await_and_spawn())
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
+        # Acknowledge the picker dispatch. The follow-up message arrives
+        # asynchronously once the user picks (or the prompt times out).
+        return ""
 
     async def _run_background_task(
         self,
