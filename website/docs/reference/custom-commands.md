@@ -75,13 +75,30 @@ steps:
           git_only: true
   - id: launch
     run:
-      shell: cd {{pick.project}} && claude --permission-mode bypassPermissions --worktree {{session}} --remote-control {{session}}
+      # claude --remote-control is interactive and needs a TTY, so launch it
+      # inside a detached tmux session (tmux -c sets the working directory).
+      # env -u ANTHROPIC_API_KEY drops the gateway's API key so claude uses the
+      # Claude Max login instead of pausing on the "use this API key?" prompt.
+      shell: tmux new-session -d -s {{session}} -c {{pick.project}} env -u ANTHROPIC_API_KEY claude --permission-mode bypassPermissions --worktree {{session}} --remote-control {{session}}
       detach: true
-  - message: "🚀 Claude Code launched on {{pick.project}} — session {{session}}"
+  - message: "🚀 Claude Code launched on {{pick.project}} in tmux session {{session}}"
 ---
 Spawn a remote-controllable Claude Code session in one of your repos.
 Usage: `/claude <session-name>`
 ```
+
+:::tip Interactive programs need a TTY (and a clean environment)
+A bare `run` step has no terminal attached (its stdio goes to `/dev/null`) and
+inherits the gateway's full environment. Two gotchas for interactive tools like
+`claude --remote-control`:
+
+- **TTY:** without a terminal they exit or drop into non-interactive mode. Launch
+  them inside `tmux new-session -d` (as above) so they get a pseudo-terminal and
+  keep running after the command returns.
+- **Environment:** the gateway often has `ANTHROPIC_API_KEY` set, which makes
+  `claude` pause on a "use this API key?" prompt. Strip variables you don't want
+  with `env -u VAR …` so the launched process starts cleanly.
+:::
 
 Run it from the CLI or any messaging platform:
 
