@@ -6511,6 +6511,28 @@ def _(rid, params: dict) -> dict:
             if not warning:
                 warning = f"quick_commands discovery unavailable: {e}"
 
+        # Custom commands (Slack-style workflow files under ~/.hermes/commands/).
+        try:
+            from agent.custom_commands import iter_command_entries
+
+            custom_entries = iter_command_entries()
+            if custom_entries:
+                bucket = "Custom commands"
+                if bucket not in cat_map:
+                    cat_map[bucket] = []
+                    cat_order.append(bucket)
+                for cname, cdesc, chint in custom_entries:
+                    key = f"/{cname}"
+                    canon[key.lower()] = key
+                    label = f"{key} {chint}".strip()
+                    cdesc = str(cdesc or "")
+                    cdesc = cdesc[:120] + ("…" if len(cdesc) > 120 else "")
+                    all_pairs.append([label, cdesc])
+                    cat_map[bucket].append([label, cdesc])
+        except Exception as e:
+            if not warning:
+                warning = f"custom command discovery unavailable: {e}"
+
         skill_count = 0
         try:
             from agent.skill_commands import scan_skill_commands

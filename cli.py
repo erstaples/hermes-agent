@@ -9129,8 +9129,6 @@ class HermesCLI:
             self._handle_agents_command()
         elif canonical == "background":
             self._handle_background_command(cmd_original)
-        elif canonical == "claude":
-            self._handle_claude_command(cmd_original)
         elif canonical == "queue":
             # Extract prompt after "/queue " or "/q "
             parts = cmd_original.split(None, 1)
@@ -9183,7 +9181,16 @@ class HermesCLI:
             skill_commands = _ensure_skill_commands()
             skill_bundles = get_skill_bundles()
             quick_commands = self.config.get("quick_commands", {})
-            if base_cmd.lstrip("/") in quick_commands:
+            # Custom commands (Slack-style workflow files under ~/.hermes/commands/).
+            # Checked before quick/skill commands: an explicit workflow file wins.
+            try:
+                from agent.custom_commands import get_command as _get_custom_command
+                _custom_spec = _get_custom_command(base_cmd.lstrip("/"))
+            except Exception:
+                _custom_spec = None
+            if _custom_spec is not None:
+                self._run_custom_command(_custom_spec, cmd_original[len(base_cmd):].strip())
+            elif base_cmd.lstrip("/") in quick_commands:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
                 if qcmd.get("type") == "exec":
                     import subprocess
@@ -9314,7 +9321,61 @@ class HermesCLI:
                     _cprint(f"{_DIM}{_ACCENT}Type /help for available commands{_RST}")
         
         return True
-    
+
+    def _run_custom_command(self, spec, arg_string: str):
+        """Execute a custom command (Slack-style workflow file) in the CLI.
+
+        Binds trigger inputs from the typed args, then runs the workflow steps
+        with a synchronous CLI frontend (numbered ``input()`` pickers, console
+        output). A trailing ``prompt:`` step is queued to the agent like a skill.
+        """
+        import asyncio
+        from agent.command_engine import (
+            bind_inputs, execute_steps, CommandUsageError, CommandAbort,
+            PromptHandoff,
+        )
+
+        try:
+            ctx = bind_inputs(spec, arg_string)
+        except CommandUsageError as exc:
+            for line in exc.usage.splitlines():
+                _cprint(f"  {line}")
+            return
+
+        class _CliFrontend:
+            async def collect(self, field, choices):
+                if choices:
+                    _cprint(f"\n  {field.description or field.name}:")
+                    for i, c in enumerate(choices, 1):
+                        _cprint(f"    {i}. {c.label}")
+                    prompt = "  > "
+                else:
+                    prompt = f"  {field.description or field.name}: "
+                try:
+                    return await asyncio.to_thread(input, prompt)
+                except (EOFError, KeyboardInterrupt):
+                    return None
+
+            async def notify(self, text):
+                _cprint(f"  {text}")
+
+        async def _run():
+            try:
+                return await execute_steps(spec, ctx, _CliFrontend())
+            except CommandAbort as exc:
+                _cprint(f"  ❌ {exc.message}")
+                return None
+
+        try:
+            result = asyncio.run(_run())
+        except Exception as exc:  # noqa: BLE001
+            _cprint(f"  ❌ Custom command error: {exc}")
+            return
+
+        if isinstance(result, PromptHandoff) and hasattr(self, "_pending_input"):
+            print(f"\n⚡ Running custom command: {spec.command}")
+            self._pending_input.put(result.text)
+
     def _handle_background_command(self, cmd: str):
         """Handle /background <prompt> — run a prompt in a separate background session.
 
@@ -9468,97 +9529,6 @@ class HermesCLI:
         thread = threading.Thread(target=run_background, daemon=True, name=f"bg-task-{task_id}")
         self._background_tasks[task_id] = thread
         thread.start()
-
-    def _handle_claude_command(self, cmd: str):
-        """Handle /claude <session-name> — spawn Claude Code in a project.
-
-        Auto-discovers git repos under ~/code/git.home/ and prompts the user
-        to pick one. Then spawns:
-
-            cd <project> && claude --remote-control <name> \\
-                --worktree <name> --permission-mode bypassPermissions
-        """
-        import shlex
-        import subprocess
-        from pathlib import Path as _Path
-
-        parts = cmd.strip().split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
-            _cprint("  Usage: /claude <session-name>")
-            _cprint("  Example: /claude docs-consolidation")
-            _cprint("  You'll be prompted to pick a project (auto-discovered)")
-            _cprint("  from ~/code/git.home/.")
-            return
-
-        session_name = parts[1].strip().split()[0]
-
-        # Discover git repos under ~/code/git.home/
-        projects_root = _Path.home() / "code" / "git.home"
-        try:
-            candidates = sorted(
-                p for p in projects_root.iterdir()
-                if p.is_dir() and (p / ".git").exists()
-            )
-        except FileNotFoundError:
-            _cprint(f"  ❌ Projects directory not found: {projects_root}")
-            return
-        except Exception as exc:
-            _cprint(f"  ❌ Failed to scan {projects_root}: {exc}")
-            return
-
-        if not candidates:
-            _cprint(f"  ❌ No git repos found under {projects_root}")
-            return
-
-        if len(candidates) == 1:
-            chosen = candidates[0]
-        else:
-            _cprint(f"\n  Pick a project for /claude {session_name}:")
-            for i, p in enumerate(candidates, 1):
-                _cprint(f"    {i}. {p.name}")
-            try:
-                raw = input("  > ").strip()
-            except (EOFError, KeyboardInterrupt):
-                _cprint("  Cancelled.")
-                return
-            chosen = None
-            if raw.isdigit():
-                idx = int(raw) - 1
-                if 0 <= idx < len(candidates):
-                    chosen = candidates[idx]
-            if chosen is None:
-                lc = raw.lower()
-                for p in candidates:
-                    if p.name.lower() == lc:
-                        chosen = p
-                        break
-            if chosen is None:
-                _cprint(f"  ❌ Couldn't match '{raw}' to a project.")
-                return
-
-        command = (
-            f"cd {shlex.quote(str(chosen))} && "
-            f"claude --remote-control {shlex.quote(session_name)} "
-            f"--worktree {shlex.quote(session_name)} "
-            f"--permission-mode bypassPermissions"
-        )
-
-        _cprint(f"  🚀 Spawning Claude Code in {chosen.name}...")
-        _cprint(f"  Session/worktree: {session_name}")
-        _cprint(f"  Command: {command}\n")
-
-        try:
-            proc = subprocess.Popen(
-                command,
-                shell=True,
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            _cprint(f"  ✅ Claude Code started (PID: {proc.pid})")
-            _cprint("  Process runs independently — check with `jobs` or `ps`.\n")
-        except Exception as e:
-            _cprint(f"  ❌ Failed to start Claude Code: {e}")
 
     @staticmethod
     def _try_launch_chrome_debug(port: int, system: str) -> bool:

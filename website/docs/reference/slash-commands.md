@@ -147,6 +147,8 @@ Then type `/status`, `/deploy`, or `/inbox` in the CLI or a messaging platform. 
 
 String-only prompt shortcuts are not supported as quick commands. Put longer reusable prompts in a skill, or use `type: alias` to point at an existing slash command.
 
+For commands that need typed arguments, interactive pickers, or several steps — like “pick a project, then launch a process there” — use [Custom Commands](./custom-commands.md) instead.
+
 ### Custom model aliases
 
 Define your own short names for models you use often, then reach them with `/model <alias>` in the CLI or any messaging platform. Aliases work identically in both, on session-only (default) and `--global` switches.

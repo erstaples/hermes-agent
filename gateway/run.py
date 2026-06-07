@@ -7929,9 +7929,23 @@ class GatewayRunner:
             # name, so this branch handles both commands.
             if _cmd_def_inner and _cmd_def_inner.name == "background":
                 return await self._handle_background_command(event)
-            # /claude spawns a Claude Code process — must bypass the guard.
-            if _cmd_def_inner and _cmd_def_inner.name == "claude":
-                return await self._handle_claude_command(event)
+
+            # Control-plane custom commands (Slack-style workflow files that
+            # never hand off to the agent) must bypass the guard too — they
+            # run shell/form/message steps in the background and don't touch
+            # the running agent's state. Prompt-bearing custom commands fall
+            # through to the normal interrupt/queue path.
+            if _cmd_def_inner is None and _evt_cmd:
+                try:
+                    from agent.custom_commands import get_command as _get_custom_cmd_inner
+                    _custom_spec_inner = _get_custom_cmd_inner(_evt_cmd)
+                except Exception:
+                    _custom_spec_inner = None
+                if _custom_spec_inner is not None and _custom_spec_inner.is_control_plane:
+                    _denied_inner = self._check_slash_access(source, _custom_spec_inner.command)
+                    if _denied_inner is not None:
+                        return _denied_inner
+                    return await self._handle_custom_command(event, _custom_spec_inner)
 
             # /kanban must bypass the guard. It writes to a profile-agnostic
             # DB (kanban.db), not to the running agent's state. In fact
@@ -8442,6 +8456,26 @@ class GatewayRunner:
                         return f"Quick command '/{command}' has no target defined."
                 else:
                     return f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias')."
+
+        # Custom commands (Slack-style workflow files under ~/.hermes/commands/).
+        # Checked before plugins/skills: an explicit workflow file wins. Control-
+        # plane commands run in the background and reply via follow-up messages;
+        # a trailing `prompt:` step sets event.text and falls through to the agent.
+        if command:
+            try:
+                from agent.custom_commands import get_command as _get_custom_cmd
+                _custom_spec = _get_custom_cmd(command)
+            except Exception as _cc_err:
+                logger.debug("Custom command lookup failed (non-fatal): %s", _cc_err)
+                _custom_spec = None
+            if _custom_spec is not None:
+                _denied = self._check_slash_access(source, _custom_spec.command)
+                if _denied is not None:
+                    return _denied
+                _cc_result = await self._handle_custom_command(event, _custom_spec)
+                if _cc_result is not None:
+                    return _cc_result
+                # else: event.text was set for an agent handoff → fall through.
 
         # Plugin-registered slash commands
         if command:
@@ -12668,6 +12702,174 @@ class GatewayRunner:
             )
         return t("gateway.rollback.restore_failed", error=result["error"])
 
+    async def _handle_custom_command(self, event: MessageEvent, spec) -> Optional[str]:
+        """Dispatch a custom command (Slack-style workflow file).
+
+        Returns a string to send as the reply (``""`` for an async control-plane
+        command whose output arrives via follow-up messages), or ``None`` when a
+        trailing ``prompt:`` step set ``event.text`` and the caller should fall
+        through to normal agent processing.
+
+        Control-plane commands (no ``prompt:`` step) run their steps in a
+        background task so the gateway event loop is never blocked while a form
+        step waits on the user's picker reply. Pickers reuse the platform
+        ``send_clarify`` primitive (inline buttons on Telegram/Discord, numbered
+        text fallback elsewhere) — no per-platform shims needed.
+        """
+        from agent.command_engine import (
+            bind_inputs, execute_steps, CommandUsageError, CommandAbort,
+        )
+
+        try:
+            ctx = bind_inputs(spec, event.get_command_args().strip())
+        except CommandUsageError as exc:
+            return exc.usage
+
+        source = event.source
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            return f"❌ No adapter registered for platform: {source.platform}"
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = f"{source.platform}:{source.chat_id}"
+        thread_metadata = self._thread_metadata_for_source(source, event.message_id)
+
+        frontend = self._GatewayCommandFrontend(
+            adapter, source, session_key, thread_metadata,
+        )
+
+        # Captured (non-detach) steps run with a sanitized env and redacted
+        # output. Detached steps inherit the full env (engine default) so tools
+        # like the `claude` CLI can reach their auth.
+        try:
+            from tools.environments.local import _sanitize_subprocess_env
+            env_capture = _sanitize_subprocess_env(os.environ.copy())
+        except Exception:
+            env_capture = os.environ.copy()
+        try:
+            from agent.redact import redact_sensitive_text as _redact
+        except Exception:
+            _redact = None
+
+        # Prompt-bearing commands hand off to the agent. Interactive collection
+        # mid-handoff isn't supported in the gateway yet (v1), so resolve them
+        # synchronously when there are no form steps and fall through.
+        if not spec.is_control_plane:
+            if spec.has_form_step:
+                return (
+                    "Interactive prompt commands aren't supported in the gateway "
+                    "yet — remove the form step or split the workflow in two."
+                )
+            try:
+                handoff = await execute_steps(
+                    spec, ctx, frontend, env_capture=env_capture, redact=_redact,
+                )
+            except CommandAbort as exc:
+                return f"❌ {exc.message}"
+            if handoff is not None:
+                event.text = handoff.text
+                return None  # fall through to agent
+            return ""
+
+        # Control-plane: run the whole workflow in the background.
+        async def _run() -> None:
+            try:
+                await execute_steps(
+                    spec, ctx, frontend, env_capture=env_capture, redact=_redact,
+                )
+            except CommandAbort as exc:
+                await frontend.notify(f"❌ {exc.message}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Custom command /%s failed: %s", spec.command, exc)
+                try:
+                    await frontend.notify(f"❌ Custom command error: {exc}")
+                except Exception:
+                    pass
+
+        _task = asyncio.create_task(_run())
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+        return ""
+
+    class _GatewayCommandFrontend:
+        """Gateway implementation of command_engine.CommandFrontend.
+
+        ``collect`` registers a clarify entry and renders it through the
+        platform's ``send_clarify`` (buttons where supported, numbered text
+        fallback otherwise), then blocks a worker thread on the user's reply.
+        ``notify`` posts a plain message to the originating chat.
+        """
+
+        def __init__(self, adapter, source, session_key, thread_metadata):
+            self._adapter = adapter
+            self._source = source
+            self._session_key = session_key
+            self._metadata = thread_metadata
+
+        async def collect(self, field, choices):
+            import uuid as _uuid
+            from tools import clarify_gateway as _cg
+
+            question = field.description or f"Select {field.name}"
+            labels = [c.label for c in choices] if choices else None
+            clarify_id = _uuid.uuid4().hex[:10]
+            _cg.register(
+                clarify_id=clarify_id,
+                session_key=self._session_key,
+                question=question,
+                choices=labels,
+            )
+
+            send_clarify_fn = getattr(self._adapter, "send_clarify", None)
+            sent_ok = False
+            if send_clarify_fn is not None:
+                try:
+                    result = await send_clarify_fn(
+                        chat_id=self._source.chat_id,
+                        question=question,
+                        choices=labels,
+                        clarify_id=clarify_id,
+                        session_key=self._session_key,
+                        metadata=self._metadata,
+                    )
+                    sent_ok = bool(getattr(result, "success", True))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("send_clarify failed for custom command: %s", exc)
+                    sent_ok = False
+
+            if not sent_ok:
+                # Fallback: numbered list as plain text, flipped into
+                # text-capture mode so the gateway intercept resolves the reply.
+                _cg.mark_awaiting_text(clarify_id)
+                if labels:
+                    menu = "\n".join(f"  {i + 1}. {l}" for i, l in enumerate(labels))
+                    body = f"{question}\nReply with the number or name:\n{menu}"
+                else:
+                    body = question
+                try:
+                    await self._adapter.send(
+                        self._source.chat_id, body, metadata=self._metadata,
+                    )
+                except Exception:
+                    _cg.clear_session(self._session_key)
+                    return None
+
+            timeout = _cg.get_clarify_timeout()
+            return await asyncio.to_thread(
+                _cg.wait_for_response, clarify_id, float(timeout),
+            )
+
+        async def notify(self, text):
+            if not text:
+                return
+            try:
+                await self._adapter.send(
+                    self._source.chat_id, text, metadata=self._metadata,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Custom command notify failed: %s", exc)
+
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
 
@@ -12704,195 +12906,6 @@ class GatewayRunner:
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
-
-    async def _handle_claude_command(self, event: MessageEvent) -> str:
-        """Handle ``/claude <session-name>`` — spawn Claude Code in a project.
-
-        Always shows a project picker (auto-discovered git repos under
-        ``~/code/git.home/``). On Telegram/Discord renders inline buttons via
-        the existing clarify primitive; on platforms without rich UI it falls
-        back to a numbered text prompt resolved by the gateway's text-intercept.
-
-        On project selection, spawns:
-            cd <project> && claude --remote-control <name> \\
-                --worktree <name> --permission-mode bypassPermissions
-
-        as a detached background process and posts the result back to the chat.
-        """
-        import asyncio as _asyncio
-        import shlex
-        import subprocess
-        import uuid as _uuid
-        from pathlib import Path as _Path
-
-        from tools import clarify_gateway as _clarify_mod
-
-        session_name = event.get_command_args().strip().split()[0] if event.get_command_args().strip() else ""
-        if not session_name:
-            return (
-                "Usage: /claude <session-name>\n"
-                "Example: /claude docs-consolidation\n"
-                "Spawns Claude Code with --remote-control, --worktree set to <session-name>, "
-                "and --permission-mode bypassPermissions. You'll be prompted to pick the project."
-            )
-
-        # Discover candidate projects: any subdirectory of ~/code/git.home/
-        # that is a git repo (has a .git/ directory or file). Sorted alphabetically.
-        projects_root = _Path.home() / "code" / "git.home"
-        try:
-            candidates = sorted(
-                p for p in projects_root.iterdir()
-                if p.is_dir() and (p / ".git").exists()
-            )
-        except FileNotFoundError:
-            return f"❌ Projects directory not found: {projects_root}"
-        except Exception as exc:
-            return f"❌ Failed to scan {projects_root}: {exc}"
-
-        if not candidates:
-            return f"❌ No git repos found under {projects_root}"
-
-        # Resolve session_key + adapter + chat_id for the picker + follow-up reply.
-        source = event.source
-        adapter = self.adapters.get(source.platform)
-        if adapter is None:
-            return f"❌ No adapter registered for platform: {source.platform}"
-        try:
-            session_key = self._session_key_for_source(source)
-        except Exception:
-            session_key = f"{source.platform}:{source.chat_id}"
-
-        thread_metadata = self._thread_metadata_for_source(source, event.message_id)
-
-        def _spawn(project_path: _Path) -> str:
-            """Spawn Claude Code in ``project_path`` and return a status string."""
-            command = (
-                f"cd {shlex.quote(str(project_path))} && "
-                f"claude --remote-control {shlex.quote(session_name)} "
-                f"--worktree {shlex.quote(session_name)} "
-                f"--permission-mode bypassPermissions"
-            )
-            try:
-                proc = subprocess.Popen(
-                    command,
-                    shell=True,
-                    start_new_session=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                return (
-                    f"🚀 Claude Code started (PID: {proc.pid})\n"
-                    f"  Project: {project_path.name}\n"
-                    f"  Session/worktree: {session_name}\n"
-                    f"  Runs detached; check `jobs` / `ps`."
-                )
-            except Exception as exc:
-                return f"❌ Failed to start Claude Code: {exc}"
-
-        # Short-circuit: only one candidate → no need to prompt.
-        if len(candidates) == 1:
-            return _spawn(candidates[0])
-
-        # Build choice labels (project name) and a parallel lookup → Path.
-        choice_labels = [p.name for p in candidates]
-        label_to_path = {p.name: p for p in candidates}
-
-        # Register a clarify entry — buttons (Telegram/Discord) or text-fallback.
-        clarify_id = _uuid.uuid4().hex[:10]
-        _clarify_mod.register(
-            clarify_id=clarify_id,
-            session_key=session_key,
-            question=f"Pick a project for `/claude {session_name}`:",
-            choices=list(choice_labels),
-        )
-
-        # Send the picker. Some adapters expose send_clarify, others don't —
-        # if not, render a numbered list as a regular message and rely on
-        # text-intercept to resolve the response.
-        send_clarify_fn = getattr(adapter, "send_clarify", None)
-        sent_ok = False
-        if send_clarify_fn is not None:
-            try:
-                result = await send_clarify_fn(
-                    chat_id=source.chat_id,
-                    question=f"Pick a project for `/claude {session_name}`:",
-                    choices=list(choice_labels),
-                    clarify_id=clarify_id,
-                    session_key=session_key,
-                    metadata=thread_metadata,
-                )
-                sent_ok = bool(getattr(result, "success", False))
-            except Exception as exc:
-                logger.warning("send_clarify failed for /claude picker: %s", exc)
-                sent_ok = False
-
-        if not sent_ok:
-            # Fallback: numbered list as plain text; flip the entry into
-            # text-capture mode so the next user reply resolves it.
-            _clarify_mod.mark_awaiting_text(clarify_id)
-            menu = "\n".join(f"  {i + 1}. {name}" for i, name in enumerate(choice_labels))
-            try:
-                await adapter.send(
-                    source.chat_id,
-                    (
-                        f"Pick a project for `/claude {session_name}` — "
-                        f"reply with the number or name:\n{menu}"
-                    ),
-                    metadata=thread_metadata,
-                )
-            except Exception as exc:
-                _clarify_mod.clear_session(session_key)
-                return f"❌ Failed to send picker: {exc}"
-
-        # Wait for the user's response on a worker thread so we don't block
-        # the gateway event loop. When it resolves, spawn Claude and post
-        # the result back to the chat as a follow-up message.
-        timeout = _clarify_mod.get_clarify_timeout()
-
-        async def _await_and_spawn() -> None:
-            response = await _asyncio.to_thread(
-                _clarify_mod.wait_for_response, clarify_id, float(timeout),
-            )
-            if not response:
-                follow_up = (
-                    f"⌛ /claude picker timed out after {int(timeout / 60)}m — "
-                    f"no project selected. Re-run `/claude {session_name}` to retry."
-                )
-            else:
-                resp = response.strip()
-                chosen: _Path | None = None
-                # Match: exact label, numeric index, case-insensitive label.
-                if resp in label_to_path:
-                    chosen = label_to_path[resp]
-                elif resp.isdigit():
-                    idx = int(resp) - 1
-                    if 0 <= idx < len(candidates):
-                        chosen = candidates[idx]
-                else:
-                    lc = resp.lower()
-                    for name, path in label_to_path.items():
-                        if name.lower() == lc:
-                            chosen = path
-                            break
-                if chosen is None:
-                    follow_up = (
-                        f"❌ Couldn't match `{response}` to a project. "
-                        f"Re-run `/claude {session_name}` and pick from the list."
-                    )
-                else:
-                    follow_up = _spawn(chosen)
-            try:
-                await adapter.send(source.chat_id, follow_up, metadata=thread_metadata)
-            except Exception as exc:
-                logger.warning("Failed to post /claude follow-up: %s", exc)
-
-        _task = _asyncio.create_task(_await_and_spawn())
-        self._background_tasks.add(_task)
-        _task.add_done_callback(self._background_tasks.discard)
-
-        # Acknowledge the picker dispatch. The follow-up message arrives
-        # asynchronously once the user picks (or the prompt times out).
-        return ""
 
     async def _run_background_task(
         self,

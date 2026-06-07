@@ -99,8 +99,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>"),
-    CommandDef("claude", "Spawn Claude Code in a chosen project with remote-control + worktree", "Session",
-               args_hint="<session-name>"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",)),
     CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
@@ -446,6 +444,13 @@ def gateway_help_lines() -> list[str]:
             alias_parts.append(f"`/{a}`")
         alias_note = f" (alias: {', '.join(alias_parts)})" if alias_parts else ""
         lines.append(f"`/{cmd.name}{args}` -- {cmd.description}{alias_note}")
+    custom_entries = _iter_custom_command_entries()
+    if custom_entries:
+        lines.append("")
+        lines.append("*Custom commands:*")
+        for name, description, args_hint in custom_entries:
+            args = f" {args_hint}" if args_hint else ""
+            lines.append(f"`/{name}{args}` -- {description}")
     return lines
 
 
@@ -481,6 +486,24 @@ def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
     return entries
 
 
+def _iter_custom_command_entries() -> list[tuple[str, str, str]]:
+    """Yield (name, description, args_hint) tuples for custom command files.
+
+    Custom commands are Slack-style workflow files under ``~/.hermes/commands/``
+    (see :mod:`agent.custom_commands`). They surface in the same gateway menus as
+    plugin commands. Lookup is lazy and never raises so importing this module
+    never forces a filesystem scan.
+    """
+    try:
+        from agent.custom_commands import iter_command_entries
+    except Exception:
+        return []
+    try:
+        return list(iter_command_entries())
+    except Exception:
+        return []
+
+
 def telegram_bot_commands() -> list[tuple[str, str]]:
     """Return (command_name, description) pairs for Telegram setMyCommands.
 
@@ -509,6 +532,12 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     for name, description, args_hint in _iter_plugin_command_entries():
         if _requires_argument(args_hint):
             continue
+        tg_name = _sanitize_telegram_name(name)
+        if tg_name:
+            result.append((tg_name, description))
+    # Custom commands are included even when they take arguments — their engine
+    # returns usage text on missing args, same as built-ins (unlike plugins).
+    for name, description, _args_hint in _iter_custom_command_entries():
         tg_name = _sanitize_telegram_name(name)
         if tg_name:
             result.append((tg_name, description))
@@ -707,6 +736,25 @@ def _collect_gateway_skill_entries(
     reserved_names.update(n for n, _ in plugin_pairs)
     # Plugins have no cmd_key — use empty string as placeholder
     for n, d in plugin_pairs:
+        all_entries.append((n, d, ""))
+
+    # --- Tier 1.5: Custom commands (never trimmed) -------------------------
+    # User-authored workflow files. Few and curated, so they sit ahead of the
+    # skill cap and are never dropped.
+    custom_pairs: list[tuple[str, str]] = []
+    try:
+        for cmd_name, desc, _args_hint in _iter_custom_command_entries():
+            name = sanitize_name(cmd_name) if sanitize_name else cmd_name
+            if not name:
+                continue
+            if len(desc) > desc_limit:
+                desc = desc[:desc_limit - 3] + "..."
+            custom_pairs.append((name, desc))
+    except Exception:
+        pass
+    custom_pairs = _clamp_command_names(custom_pairs, reserved_names)
+    reserved_names.update(n for n, _ in custom_pairs)
+    for n, d in custom_pairs:
         all_entries.append((n, d, ""))
 
     # --- Tier 2: Built-in skill commands (trimmed at cap) -----------------

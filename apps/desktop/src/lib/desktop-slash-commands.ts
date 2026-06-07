@@ -26,7 +26,6 @@ const DESKTOP_COMMAND_META = [
   ['/agents', 'Show active desktop sessions and running tasks'],
   ['/background', 'Run a prompt in the background'],
   ['/branch', 'Branch the latest message into a new chat'],
-  ['/claude', 'Spawn Claude Code in homelab with remote-control and worktree'],
   ['/compress', 'Compress this conversation context'],
   ['/debug', 'Create a debug report'],
   ['/goal', 'Manage the standing goal for this session'],
