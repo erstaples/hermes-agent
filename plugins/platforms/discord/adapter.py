@@ -3425,6 +3425,33 @@ class DiscordAdapter(BasePlatformAdapter):
                 "Discord auto-register from plugin commands failed: %s", e
             )
 
+        # ── Custom commands (Slack-style workflow files) ──
+        # Definitions under ~/.hermes/commands/ surface as native slash
+        # commands too, proxying to the same dispatch path. Their picker steps
+        # render via send_clarify (native buttons), so a control-plane command
+        # like /claude works end-to-end from Discord's slash UI.
+        try:
+            from hermes_cli.commands import _iter_custom_command_entries
+
+            for cc_name, cc_desc, cc_args_hint in _iter_custom_command_entries():
+                discord_name = cc_name.lower()[:32]
+                if discord_name in already_registered:
+                    continue
+                auto_cmd = _build_auto_slash_command(
+                    cc_name,
+                    cc_desc,
+                    cc_args_hint,
+                )
+                try:
+                    tree.add_command(auto_cmd)
+                    already_registered.add(discord_name)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(
+                "Discord auto-register from custom commands failed: %s", e
+            )
+
         # Register skills under a single /skill command group with category
         # subcommand groups.  This uses 1 top-level slot instead of N,
         # supporting up to 25 categories × 25 skills = 625 skills.
